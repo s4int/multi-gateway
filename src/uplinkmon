@@ -1,0 +1,245 @@
+#!/bin/bash
+
+pid_file="/var/run/$0.pid";
+CONFIGFILE="/etc/default/uplinkmon"
+UPLINKS=('eth0=1.1.1.1' 'eth1=1.1.2.1')
+SLEEPTIME=5
+LOG_LEVEL=7
+
+SCRIPTNAME="$(basename $0)"
+
+log() {
+    #level
+    # This determines the importance of the message.  The levels are, in order of decreasing importance:
+    # EMERG    0  system is unusable
+    # ALERT    1  action must be taken immediately
+    # CRIT     2  critical conditions
+    # ERR      3  error conditions
+    # WARNING  4  warning conditions
+    # NOTICE   5  normal, but significant, condition
+    # INFO     6  informational message
+    # DEBUG    7  debug-level message
+    declare -A LEVELS=([EMERG]=0 [ALERT]=1 [CRIT]=2 [ERR]=3 [WARNING]=4 [NOTICE]=5 [INFO]=6 [DEBUG]=7)
+    
+    if [ "$#" -ne 2 ]
+    then
+        local MSG=$1
+        logger -t "$SCRIPTNAME" -i "$MSG"
+    else
+        local LEVEL=$1
+        local MSG=$2
+        if [ $LOG_LEVEL -ge ${LEVELS[$LEVEL]} ]
+        then
+            logger -t "$SCRIPTNAME" -i -p user.$LEVEL "[$LEVEL] $MSG"
+        fi
+    fi
+}
+
+loadConfig() {
+
+    if [ -f $CONFIGFILE ] ; then
+        . $CONFIGFILE
+    fi
+
+}
+
+sort_array() {
+    local name=$1
+
+    local cmd="\$(echo \${$name[@]}|tr ' ' \"\n\"|sort)"
+    eval $name=\( $cmd \)
+}
+
+check_ip() {
+    # $1 - if name f.e. eth0
+    # $2 - ip
+    local iff=$1
+    local ip=$2
+
+    out=$(ping -q -r -W 3 -c 2 -I $iff $ip 2>&1)
+    ret=$?
+
+    log DEBUG "check_ip: $out"
+    log DEBUG "check_ip return code: $ret"
+    return $ret
+}
+ 
+check_uplink() {
+    # $1 - ifname
+    # $2 - gw ip address
+
+    local IFNAME=$1
+    local GWADDR=$2
+
+    # Test connection to uplink GW
+    check_ip $IFNAME $GWADDR
+    if [ "$?" -eq 0 ]
+    then
+        # uplink GW OK
+        log DEBUG "$IFNAME -> $GWADDR router OK"
+        return 0
+    else
+        # uplink GW FAIL
+        log WARNING "$IFNAME -> $GWADDR router FAIL"
+    fi
+    return 1
+}
+
+get_ip() {
+    # get ip from string like: eth0=1.1.1.1
+    echo ${1##*=}
+}
+
+get_iff() {
+    # get ifname from string like: eth0=1.1.1.1
+    echo ${1%%=*}
+}
+
+compare_stat() {
+    # $1 old status
+    # $2 new status
+
+    declare -a OLD=("${!1}")
+    declare -a NEW=("${!2}")
+
+    if [ ${#OLD[@]} -ne ${#NEW[@]} ]
+    then
+        return 1
+    fi
+
+    for i in $(seq 0 $((${#NEW[@]}-1)) )
+    do
+        if [ ${OLD[$i]} != ${NEW[$i]} ]
+        then
+            return 1
+        fi
+    done
+    return 0
+}
+
+reset_default_gw() {
+    log DEBUG "Route before del: $(ip route)"
+    while ip route del default; do :; done
+    log DEBUG "Route after del: $(ip route)"
+    ip route flush cache
+    ip neigh flush all
+}
+ 
+set_default_gw() {
+    local ROUTES=("${!1}")
+    local route=()
+    
+    for i in "${ROUTES[@]}"
+    do
+        route+=("nexthop via $(get_ip $i) dev $(get_iff $i)")
+    done
+
+    local new_route="ip route replace default ${route[@]}"
+    log "New route: $new_route"
+    $($new_route)
+}
+
+work() {
+    declare -a OLD_STAT=()
+    
+    while [ true ];
+    do
+        declare -a NEW_STAT=()
+
+    	# Check UPLINKS STATs
+        loadConfig
+        sort_array UPLINKS
+	    for uplink in "${UPLINKS[@]}"
+    	do
+            if [ "$(ip link show dev $(get_iff $uplink) | egrep -o 'state [a-Z]*')" != "state DOWN" ]
+            then
+                # if interface state is UP
+                # check if link is up
+	    	    check_uplink $(get_iff $uplink) $(get_ip $uplink)
+		        if [ "$?" -eq 0 ]
+		        then
+			        # uplink OK
+                    NEW_STAT+=($uplink)
+    		    fi
+            else
+                log WARNING "Interface: $(get_iff $uplink) down"
+	    	fi
+    	done
+        
+        compare_stat OLD_STAT[@] NEW_STAT[@]
+        if [ "$?" -ne 0 ]
+        then
+            if [ "${#NEW_STAT[@]}" -gt 0 ]
+            then
+                reset_default_gw
+                set_default_gw NEW_STAT[@]
+            fi
+        fi
+
+        OLD_STAT=("${NEW_STAT[@]}")
+
+        log DEBUG "Sleep $SLEEPTIME"
+        sleep $SLEEPTIME
+    done
+}
+
+loadConfig
+case "$1" in
+    -d|--daemon)
+        if [ -f $pid_file ]
+        then
+            log WARNING "Script already running - PID: $(cat $pid_file)"
+        else
+            echo $$ > $pid_file;
+            log "Demonize - PID: $(cat $pid_file)"
+            work
+        fi
+    ;;
+    start)
+        if [ -f $pid_file ]
+        then
+            echo "$SCRIPTNAME already running."
+            echo "pid: $(cat $pid_file)"
+            log WARNING "Script already running - PID: $(cat $pid_file)"
+        else
+            echo "Starting $SCRIPTNAME"
+            log "Starting"
+            #$0 --daemon < /dev/null &> /dev/null & disown
+            nohup bash $0 --daemon 0<&- 1>/dev/null 2>&1 &
+        fi;
+        exit 1;
+    ;;
+    stop)
+        echo "Stopping $SCRIPTNAME"
+
+        if [ -f $pid_file ]
+        then
+            kill -9 $(cat $pid_file);
+            log "Stop - PID: $(cat $pid_file)"
+            rm -f $(readlink -f $pid_file)
+        fi;
+        exit 0;
+
+    ;;
+    restart)
+        bash $0 stop
+        bash $0 start
+    ;;
+    status)
+        echo "Status"
+        if [ -f $pid_file ]
+        then
+            echo "PID: $(cat $pid_file)"
+            echo "PID File: $(readlink -f $pid_file)"
+        fi;
+        exit 0;
+    ;;
+    *)
+
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1;
+
+    ;;
+esac
+
+exit 0;
